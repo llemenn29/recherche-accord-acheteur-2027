@@ -10,11 +10,19 @@ st.set_page_config(page_title="Recherche Acheteur - Accords 2027", page_icon="�
 # ============================================================
 @st.cache_data
 def load_data():
-    df = pd.read_csv("app_data.csv", dtype={"Code GNX": str}, encoding="utf-8-sig")
+    df = pd.read_csv("app_data.csv", dtype={"Code GNX": str, "CodeNegoscope": str}, encoding="utf-8-sig")
     df["Ambigu"] = df["Ambigu"].astype(str).str.lower().isin(["true", "1"])
     return df
 
 df = load_data()
+
+def extract_condition_num(code):
+    m = re.search(r'(\d+)$', str(code))
+    return int(m.group(1)) if m else 999999
+
+def normalize_code_token(c):
+    c = str(c).strip()
+    return c.lstrip("0") or "0"
 
 # ============================================================
 # En-tête
@@ -29,12 +37,17 @@ with st.expander("ℹ️ Comment ça marche ?", expanded=False):
     st.markdown("""
     - Un **Négoscope** est un périmètre de négociation global avec un fournisseur.
     - Un **Sous-négoscope** est un sous-périmètre plus précis, rattaché à un Négoscope.
+    - La clé d'un **Accord** est la combinaison **Nom de l'accord + Négoscope** : un accord n'a qu'un seul
+      Négoscope rattaché, mais peut concerner plusieurs Sous-négoscopes.
     - La colonne **Code GNX** indique, pour chaque ligne d'accord, l'ensemble des codes ERP rattachés :
         - Au niveau du **Négoscope global**, elle regroupe **tous les codes** de ses sous-négoscopes.
         - Au niveau d'un **Sous-négoscope**, elle n'affiche que **son propre code**.
-    - **Exemple** : taper `001581` fait apparaître le fournisseur **SBV**. Les lignes liées au Négoscope
-      `NS - 050107 - SBV` afficheront `Code GNX = 001581, 001582, 001583, 001584`, tandis que les lignes
-      liées au Sous-négoscope `SNS - 001581 - SBV BRUT SURG` n'afficheront que `001581`.
+    - 🏢 Un bandeau met en évidence le **nom** de chaque fournisseur trouvé ainsi que l'**ensemble de ses
+      codes GNX** rattachés.
+    - 📋 Un **tableau résumé des accords** s'affiche ensuite. **Cliquez sur une ligne** pour filtrer le détail
+      ci-dessous sur cet accord précis (utile quand un fournisseur a plusieurs accords, ex : BONDUELLE).
+    - 📊 Les résultats du détail sont **classés automatiquement par Code Condition**, en se basant sur les
+      chiffres situés à droite du code (ex : CCP001 → 001 → en premier, puis PPP002 → 002, etc.).
     - ⚠️ Certains codes sont **ambigus** (portés par plusieurs négoscopes différents). Une alerte s'affiche
       dans ce cas — vérifiez bien le nom du fournisseur.
     """)
@@ -71,7 +84,7 @@ with col2:
 st.divider()
 
 # ============================================================
-# Logique de filtrage
+# Logique de filtrage principal
 # ============================================================
 def normalize_code(c):
     c = c.strip()
@@ -93,8 +106,9 @@ elif fournisseur_text.strip():
 
 elif code_input.strip():
     code_norm = normalize_code(code_input)
+    code_stripped = normalize_code_token(code_norm)
     mask = df["Code GNX_list"].astype(str).apply(
-        lambda s: code_norm.lstrip("0") in [x.strip().lstrip("0") for x in s.split(",")]
+        lambda s: code_stripped in [normalize_code_token(x) for x in s.split(",")]
     )
     result = df[mask].copy()
     fournisseurs_trouves = result["Fournisseur"].unique().tolist()
@@ -120,12 +134,103 @@ if not result.empty:
             icon="⚠️"
         )
 
-    nb_accords = result["Accord"].nunique()
-    nb_fournisseurs = result["Fournisseur"].nunique()
+    nb_accords = result.groupby(["Accord", "root_name"]).ngroups
+    nb_fournisseurs_r = result["Fournisseur"].nunique()
     c1, c2, c3 = st.columns(3)
-    c1.metric("Lignes trouvées", len(result))
+    c1.metric("Lignes trouvées (total)", len(result))
     c2.metric("Accord(s) concerné(s)", nb_accords)
-    c3.metric("Fournisseur(s)", nb_fournisseurs)
+    c3.metric("Fournisseur(s)", nb_fournisseurs_r)
+
+    # --------------------------------------------------------
+    # Bandeau Nom fournisseur + Codes GNX rattachés
+    # --------------------------------------------------------
+    st.markdown("#### 🏢 Fournisseur(s) identifié(s) — Codes GNX rattachés")
+    supplier_groups = {}
+    for _, row in result.iterrows():
+        nom = row["Fournisseur"]
+        codes = [c.strip() for c in str(row["Code GNX_list"]).split(",") if c.strip()]
+        supplier_groups.setdefault(nom, set()).update(int(c) for c in codes)
+
+    for nom in sorted(supplier_groups.keys()):
+        codes_sorted = sorted(supplier_groups[nom])
+        codes_str = "  ".join(f"`{c:06d}`" for c in codes_sorted)
+        st.markdown(f"**{nom}** : {codes_str}")
+
+    st.markdown("---")
+
+    # --------------------------------------------------------
+    # Tableau résumé des accords (clé = Accord + Négoscope)
+    # --------------------------------------------------------
+    st.markdown(f"#### 📋 Résumé des accords concernés ({nb_accords} accord(s))")
+
+    summary_rows = []
+    for (acc, root), grp in result.groupby(["Accord", "root_name"]):
+        fournisseur = grp["Fournisseur"].iloc[0]
+        all_slabs = sorted(grp["Negoscope_SousNegoscope"].unique())
+        sous_negoscopes = [s for s in all_slabs if s.strip().startswith("SNS")]
+        all_codes = set()
+        for l in grp["Code GNX_list"]:
+            for c in str(l).split(","):
+                c = c.strip()
+                if c:
+                    all_codes.add(int(c))
+        codes_gnx_str = ", ".join(f"{c:06d}" for c in sorted(all_codes))
+        summary_rows.append({
+            "Fournisseur": fournisseur,
+            "Accord": acc,
+            "Négoscope": root,
+            "Sous-négoscopes concernés": ", ".join(sous_negoscopes) if sous_negoscopes else "—",
+            "Codes GNX concernés": codes_gnx_str,
+            "_key": f"{acc}||{root}"
+        })
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("Accord").reset_index(drop=True)
+
+    if len(summary_df) > 1:
+        st.caption("👆 Sélectionnez un accord ci-dessous pour focaliser le détail sur celui-ci (ou laissez sur « Tous »).")
+
+    options = ["— Tous les accords —"] + summary_df["_key"].tolist()
+    labels = {row["_key"]: f"{row['Accord']} | {row['Négoscope']}" for _, row in summary_df.iterrows()}
+
+    def format_option(key):
+        if key == "— Tous les accords —":
+            return "🔁 Tous les accords"
+        return labels.get(key, key)
+
+    selected_key = st.selectbox(
+        "Filtrer le détail sur un accord précis :",
+        options=options,
+        format_func=format_option,
+        index=0,
+        key="accord_focus"
+    )
+
+    st.dataframe(
+        summary_df.drop(columns=["_key"]),
+        use_container_width=True,
+        height=min(350, 60 + 35 * len(summary_df))
+    )
+
+    # --------------------------------------------------------
+    # Application du filtre de focus sur le détail
+    # --------------------------------------------------------
+    if selected_key != "— Tous les accords —":
+        acc_sel, root_sel = selected_key.split("||")
+        detail_df = result[(result["Accord"] == acc_sel) & (result["root_name"] == root_sel)].copy()
+        st.info(f"🔎 Détail filtré sur l'accord **{acc_sel}** — Négoscope **{root_sel}** "
+                f"({len(detail_df)} ligne(s) de condition)")
+    else:
+        detail_df = result.copy()
+
+    st.markdown("---")
+
+    # --------------------------------------------------------
+    # Tableau détail des conditions, trié par Code Condition (suffixe numérique)
+    # --------------------------------------------------------
+    st.markdown("#### 📑 Détail des conditions négociées")
+
+    detail_df["_CondNum"] = detail_df["Code_Condition"].apply(extract_condition_num)
+    detail_df = detail_df.sort_values("_CondNum").reset_index(drop=True)
 
     display_cols = ["Fournisseur", "Accord", "Negoscope_SousNegoscope", "Code GNX",
                      "Code_Condition", "Libelle_Condition", "Valeur"]
@@ -134,14 +239,15 @@ if not result.empty:
         "Code_Condition": "Code Condition",
         "Libelle_Condition": "Libellé Condition",
     }
-
-    display_df = result[display_cols].rename(columns=rename_cols).reset_index(drop=True)
+    display_df = detail_df[display_cols].rename(columns=rename_cols).reset_index(drop=True)
 
     def highlight_ambigu(row):
-        orig_idx = result.index[row.name]
-        if result.loc[orig_idx, "Ambigu"]:
+        orig_idx = detail_df.index[row.name]
+        if detail_df.loc[orig_idx, "Ambigu"]:
             return ["background-color: #FFF3CD"] * len(row)
         return [""] * len(row)
+
+    st.caption("📊 Classement : Code Condition croissant (basé sur le suffixe numérique, ex: CCP001 → 1).")
 
     st.dataframe(
         display_df.style.apply(highlight_ambigu, axis=1),
